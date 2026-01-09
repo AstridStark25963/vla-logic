@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ROS
+*.log
+*.bag
+
+# Logs
+*.log
+inference_server_*.log
+control_client_*.log
+
+# Temporary files
+*.pkl.tmp
+real_trajectory_temp.pkl
+/tmp/
+
+# Model checkpoints (too large)
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Data
+*.npy
+*.npz
+
+# OS
+.DS_Store
+Thumbs.db
