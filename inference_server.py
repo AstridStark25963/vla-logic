@@ -25,7 +25,7 @@ from datetime import datetime
 
 # 添加项目路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from eval_real_franka import llava_pythia_act_policy
+from eval_real_franka import llava_pythia_act_policy, openvla_act_policy
 
 
 def setup_logging():
@@ -91,17 +91,27 @@ class InferenceServer:
             task_description: 任务描述
         """
         # 初始化ROS节点
-        rospy.init_node('tinyvla_inference_server', anonymous=False)
+        rospy.init_node('vla_inference_server', anonymous=False)
         rospy.loginfo("正在初始化推理服务器...")
 
         # 配置参数
         self.policy_config = policy_config
         self.task_description = task_description
 
+        # 确定使用哪个策略 (TinyVLA 或 OpenVLA)
+        policy_type = policy_config.get('policy_type', 'tinyvla')
+        
         # 加载模型
-        rospy.loginfo("正在加载TinyVLA模型...")
-        self.policy = llava_pythia_act_policy(self.policy_config)
-        rospy.loginfo("模型加载完成")
+        if policy_type == 'openvla':
+            rospy.loginfo("正在加载 OpenVLA-7B 模型...")
+            self.policy = openvla_act_policy(self.policy_config)
+            self.policy_name = "OpenVLA-7B"
+        else:
+            rospy.loginfo("正在加载 TinyVLA 模型...")
+            self.policy = llava_pythia_act_policy(self.policy_config)
+            self.policy_name = "TinyVLA"
+        
+        rospy.loginfo(f"✅ {self.policy_name} 模型加载完成")
 
         # 加载数据集统计信息
         stats_path = os.path.join(self.policy_config['model_path'], 'dataset_stats.pkl')
@@ -161,7 +171,7 @@ class InferenceServer:
         rospy.Timer(rospy.Duration(10.0), self.print_stats)
 
         rospy.loginfo("=" * 60)
-        rospy.loginfo("推理服务器启动完成")
+        rospy.loginfo(f"推理服务器启动完成 ({self.policy_name})")
         rospy.loginfo("主机A IP: 192.168.1.10")
         rospy.loginfo("ROS Master: 192.168.1.12")
         rospy.loginfo("任务描述: %s", self.task_description)
@@ -235,16 +245,47 @@ class InferenceServer:
                 curr_image, robot_state, self.task_description
             )
 
-            # 运行推理
-            # 🔧 重要：不设置固定随机种子！
-            # 原因：固定seed会让扩散模型输出几乎不依赖输入变化
-            # 扩散模型需要随机性来根据不同的视觉观察生成不同的动作
+            # 根据策略类型运行推理
+            policy_type = self.policy_config.get('policy_type', 'tinyvla')
+            
             with torch.inference_mode():
-                all_actions = self.policy.policy(**batch, eval=True)
+                if policy_type == 'openvla':
+                    # OpenVLA 推理流程
+                    # OpenVLA 使用 processor 处理输入并调用 predict_action
+                    inputs = self.policy.processor(
+                        text=batch['prompt'],
+                        images=batch['images'].cpu().numpy().transpose(0, 2, 3, 1),  # (1, 224, 224, 3)
+                        return_tensors="pt"
+                    ).to("cuda")
+                    
+                    # OpenVLA 直接输出动作，使用 predict_action 方法
+                    # unnorm_key 指定反归一化使用的数据集类型
+                    all_actions = self.policy.policy.predict_action(
+                        **inputs, 
+                        unnorm_key="bridge_orig"  # 使用 bridge 数据集的归一化参数
+                    )
+                    
+                    # OpenVLA 输出形状: (batch, horizon, action_dim)
+                    # 需要将其转换为 (horizon, action_dim)
+                    if all_actions.dim() == 3:
+                        all_actions = all_actions.squeeze(0)  # (horizon, action_dim)
+                    
+                else:
+                    # TinyVLA 推理流程 (原始代码)
+                    # 🔧 重要：不设置固定随机种子！
+                    # 原因：固定seed会让扩散模型输出几乎不依赖输入变化
+                    # 扩散模型需要随机性来根据不同的视觉观察生成不同的动作
+                    all_actions = self.policy.policy(**batch, eval=True)
 
             # 后处理动作
             post_process = lambda a: a * self.stats['action_std'] + self.stats['action_mean']
-            raw_actions = all_actions[0].cpu().numpy()  # (chunk_size, action_dim)
+            
+            if policy_type == 'openvla':
+                # OpenVLA 输出已经是动作空间，可能不需要后处理
+                # 但为了与现有系统兼容，仍然应用后处理
+                raw_actions = all_actions.cpu().numpy()  # (chunk_size, action_dim)
+            else:
+                raw_actions = all_actions[0].cpu().numpy()  # (chunk_size, action_dim)
 
             # 应用后处理
             processed_actions = np.array([post_process(action) for action in raw_actions])
@@ -294,16 +335,34 @@ def main():
     logger.info("推理服务器启动中...")
     logger.info("="*60)
 
-    # 模型配置
-    action_head = 'droid_diffusion'
-    policy_config = {
-        "model_path": "/home/tianxiaoyan/TinyVLA/output/droid_multi_task_processed_latest",
-        "model_base": "./checkpoints/llava-pythia-13b",
-        "enable_lora": True,
-        "conv_mode": "pythia",
-        "action_head": action_head,
-        "action_head_type": action_head,
-    }
+    # ========== 配置选择 ==========
+    # 设置为 'tinyvla' 或 'openvla'
+    USE_POLICY = 'openvla'  # 改为 'openvla' 以使用 OpenVLA-7B
+    # ==============================
+
+    if USE_POLICY == 'openvla':
+        # OpenVLA-7B 配置
+        policy_config = {
+            "policy_type": "openvla",
+            "model_path": "~/Desktop/openvla/openvla-7b",  # 本地 OpenVLA 模型路径
+            "action_dim": 7,  # 机器人动作维度 (7 DOF)
+            "chunk_size": 50,  # 动作序列长度
+            "image_size": 224,  # OpenVLA 使用 224x224
+        }
+        logger.info("使用 OpenVLA-7B 模型")
+    else:
+        # TinyVLA 配置 (原始配置)
+        action_head = 'droid_diffusion'
+        policy_config = {
+            "policy_type": "tinyvla",
+            "model_path": "/home/tianxiaoyan/TinyVLA/output/droid_multi_task_processed_latest",
+            "model_base": "./checkpoints/llava-pythia-13b",
+            "enable_lora": True,
+            "conv_mode": "pythia",
+            "action_head": action_head,
+            "action_head_type": action_head,
+        }
+        logger.info("使用 TinyVLA 模型")
 
     # 任务描述 - 必须与训练数据一致！
     task_description = "pick up the wooden block and place it in the blue basket"
