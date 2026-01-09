@@ -1,8 +1,0 @@
-# OpenVLA Client Python 依赖
-numpy>=1.21.0
-opencv-python>=4.5.0
-scipy>=1.7.0
-
-# 注意:  ROS 相关包通过系统安装，不在这里列出
-# 安装命令: 
-# sudo apt-get install ros-noetic-cv-bridge ros-noetic-actionlib
