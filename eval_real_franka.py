@@ -687,6 +687,183 @@ class llava_pythia_act_policy:
             images_r=image_tensor_secondary,
             states=states
         )
+
+
+class openvla_act_policy:
+    """
+    OpenVLA-7B 策略类
+    
+    特点:
+    - 使用 AutoModelForVision2Seq 加载 OpenVLA-7B
+    - 双视觉编码器: DINOv2 + SigLIP
+    - 图像尺寸: 224x224 (不同于 TinyVLA 的 320x320)
+    - 直接输出动作序列，无需额外扩散解码器
+    - 保持与 llava_pythia_act_policy 相同的接口
+    """
+    
+    def __init__(self, policy_config, data_args=None):
+        """
+        初始化 OpenVLA 策略
+        
+        Args:
+            policy_config: 策略配置字典，包含:
+                - model_path: OpenVLA 模型路径 (本地路径)
+                - image_size: 图像尺寸 (默认 224)
+                - action_dim: 动作维度 (默认 7)
+                - device: 设备 (默认 "cuda")
+                - chunk_size: 动作序列长度
+            data_args: 数据参数 (可选)
+        """
+        super().__init__()
+        self.data_args = data_args
+        self.load_policy(policy_config)
+    
+    def load_policy(self, policy_config):
+        """
+        加载 OpenVLA 模型
+        
+        使用 transformers 的 AutoModelForVision2Seq 加载 OpenVLA-7B
+        """
+        import os
+        import torch
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+        
+        # 1. 保存配置
+        self.policy_config = policy_config
+        
+        # 2. 获取模型路径（支持 ~ 扩展）
+        model_path = os.path.expanduser(policy_config.get("model_path", "~/Desktop/openvla/openvla-7b"))
+        
+        print(f"正在从 {model_path} 加载 OpenVLA-7B 模型...")
+        
+        # 3. 检查路径是否存在
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型路径不存在: {model_path}")
+        
+        # 4. 加载模型
+        try:
+            self.policy = AutoModelForVision2Seq.from_pretrained(
+                model_path,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True
+            )
+            
+            # 移动到 GPU
+            self.policy = self.policy.cuda()
+            self.policy.eval()  # 设置为评估模式
+            
+            print(f"✅ OpenVLA 模型加载完成，设备: {next(self.policy.parameters()).device}")
+            
+        except Exception as e:
+            print(f"❌ 模型加载失败: {e}")
+            raise
+        
+        # 5. 加载图像处理器
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                model_path,
+                trust_remote_code=True
+            )
+            print("✅ OpenVLA 图像处理器加载完成")
+            
+        except Exception as e:
+            print(f"❌ 图像处理器加载失败: {e}")
+            raise
+        
+        # 6. 设置配置
+        self.config = self.policy.config
+        
+        # 确保配置中包含必要的参数
+        if not hasattr(self.config, 'action_dim'):
+            self.config.action_dim = policy_config.get('action_dim', 7)
+        
+        if not hasattr(self.config, 'chunk_size'):
+            self.config.chunk_size = policy_config.get('chunk_size', 50)
+        
+        # OpenVLA 的图像尺寸是 224x224
+        self.image_size = 224
+        
+        print(f"OpenVLA 配置:")
+        print(f"  - 动作维度: {self.config.action_dim}")
+        print(f"  - 序列长度: {self.config.chunk_size}")
+        print(f"  - 图像尺寸: {self.image_size}x{self.image_size}")
+        print("✅ OpenVLA 策略加载完成")
+    
+    def process_batch_to_llava(self, curr_image, robo_state, raw_lang):
+        """
+        处理输入数据为 OpenVLA 格式
+        
+        Args:
+            curr_image: 图像张量 (2, H, W, 3) 或 (2, 3, H, W)，值域 [0, 1]
+            robo_state: 机器人状态张量 (1, state_dim)
+            raw_lang: 语言指令字符串
+        
+        Returns:
+            dict: 包含 OpenVLA 所需的输入数据
+        """
+        # 确保图像格式正确
+        if len(curr_image.shape) == 5:
+            curr_image = curr_image.squeeze(0)  # (2, H, W, 3)
+        
+        # 转换为 (2, 3, H, W) 如果需要
+        if curr_image.shape[-1] == 3:
+            curr_image = curr_image.permute(0, 3, 1, 2)
+        
+        assert curr_image.dim() == 4 and curr_image.shape[0] == 2, \
+            f"期望图像形状 (2, 3, H, W)，实际: {curr_image.shape}"
+        
+        # 获取模型数据类型
+        model_dtype = next(self.policy.parameters()).dtype
+        
+        # 处理双目图像
+        processed_images = []
+        for i in range(2):
+            img = curr_image[i]  # (3, H, W)
+            
+            # 调整到 224x224
+            img_resized = torch.nn.functional.interpolate(
+                img.unsqueeze(0), 
+                size=(self.image_size, self.image_size), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(0)  # (3, 224, 224)
+            
+            # 归一化 (OpenVLA 使用标准 ImageNet 归一化)
+            mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(3, 1, 1)
+            img_norm = (img_resized - mean) / std
+            
+            processed_images.append(img_norm.unsqueeze(0).to(dtype=model_dtype))
+        
+        # 合并图像 (2, 3, 224, 224)
+        image_tensor = torch.cat(processed_images, dim=0).to(self.policy.device)
+        
+        # OpenVLA 使用主视角图像
+        image_tensor_main = image_tensor[0:1]  # (1, 3, 224, 224)
+        
+        # 构建提示词 (OpenVLA 格式)
+        prompt = f"USER: What action should the robot take to {raw_lang}?\nASSISTANT:"
+        
+        # 处理机器人状态
+        states = robo_state.to(self.policy.device, dtype=model_dtype)
+        
+        # 返回 OpenVLA 所需的输入格式
+        return dict(
+            images=image_tensor_main,
+            prompt=prompt,
+            states=states
+        )
+    
+    def __call__(self, *args, **kwargs):
+        """
+        直接调用策略模型进行推理
+        
+        这个方法使 openvla_act_policy 可以像函数一样被调用
+        """
+        return self.policy(*args, **kwargs)
+
+
 class FrankaROSEnvironment:
     def __init__(self, left_cam_id=4, right_cam_id=10):
         self.left_cam_id = left_cam_id
